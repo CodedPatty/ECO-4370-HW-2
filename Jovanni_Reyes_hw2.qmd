@@ -1,0 +1,321 @@
+---
+title: "ECON 4370/6370 — Homework 2"
+author: "Jovanni Reyes (SMU ID: 49750812)"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+format: 
+  html:
+    theme: flatly
+    # css: css/notes_styles.css 
+---
+
+
+
+::: {.callout-smu-blue}
+- This homework is a *coding* assignment. Please follow the instructions to complete the tasks.
+- Use Quarto/Knitr chunks for all work.
+- Turn in the rendered HTML **and** your `.qmd` source via Canvas.
+:::
+
+## 0. Setup
+
+```{r, message=FALSE}
+set.seed(123)  # Please don't change this seed.
+
+# You may load packages you plan to use (optional):
+library(tidyverse)
+library(readxl)
+library(zoo)
+library(lubridate)
+library(forecast)
+
+# Read in the CPS data we used in the lecture
+cps <- read_csv("./data/cps09mar.csv")
+
+# Read in the Welch Goyal Data we used in the lecture
+data_raw <- read_excel("./data/PredictorData2018.xlsx",
+                       sheet = "Monthly",
+                       col_names = TRUE,
+                       na = "NaN")
+
+# Transform the Welch-Goyal data
+data_wg <- data_raw %>% 
+    transmute(
+        date = zoo::as.yearmon(lubridate::ymd(yyyymm, truncated = 2)),
+        ExReturn = log(Index) - log(c(1,Index[-length(Index)])),
+        dp = log(D12) - log(Index),
+        dy = log(D12) - log( c(1, Index[-length(Index)]) ),
+        ep = log(E12) - log(Index),
+        tms = lty - tbl,
+        dfy = BAA - AAA,
+        dfr = corpr - ltr,
+        bm = `b/m`,
+        tbl = tbl,
+        ltr = ltr,
+        ntis = ntis,
+        svar = svar,
+        infl = infl
+    ) %>% 
+    filter(row_number() > 1)
+```
+
+
+## 1. Return to Education for Subgroups
+
+In this exercise, we will estimate the Mincer equation for different subgroups based on gender and education level. The Mincer equation relates log wages to education and experience:
+
+$$\log(w_i) = \alpha + \beta_1 \cdot \text{education}_i + \beta_2 \cdot \text{experience}_i + \beta_3 \cdot \text{experience}_i^2 + \varepsilon_i$$
+
+### Step 1: Prepare the data
+
+First, prepare the CPS data for the Mincer regression analysis:
+
+```{r q1-prepare-data}
+cps_mincer <- cps %>%
+  filter(
+    earnings > 0,
+    hours > 0,
+    week > 0,
+    hours <= 80,
+    week <= 52
+  ) %>%
+  mutate(
+    wage_hourly = earnings / (hours * week),
+    log_wage = log(wage_hourly),
+    experience = pmax(age - education - 6, 0),
+    exp2 = experience^2,
+    gender_group = ifelse(female == 0, "Male", "Female"),
+    edu_group = ifelse(education <= 12, "High School or Less", "College+"),
+    subgroup = paste(gender_group, edu_group, sep = ", ")
+  ) %>%
+  filter(
+    !is.na(log_wage),
+    !is.na(education),
+    !is.na(experience),
+    !is.na(exp2),
+    !is.na(gender_group),
+    !is.na(edu_group)
+  )
+
+head(cps_mincer)
+```
+
+### Step 2: Estimate the Mincer equation for different subgroups
+
+Estimate the Mincer equation separately for each subgroup:
+
+```{r q1-estimate-subgroups}
+mincer_est <- function(data, subgroup_name) {
+  model <- lm(log_wage ~ education + experience + exp2, data = data)
+  coefs <- coef(model)
+  ses <- summary(model)$coefficients[, "Std. Error"]
+
+  data.frame(
+    subgroup = subgroup_name,
+    alpha = unname(coefs[1]),
+    beta_edu = unname(coefs[2]),
+    beta_exp = unname(coefs[3]),
+    beta_exp2 = unname(coefs[4]),
+    se_edu = unname(ses[2]),
+    r_squared = summary(model)$r.squared,
+    n_obs = nobs(model)
+  )
+}
+
+subgroups <- unique(cps_mincer$subgroup)
+
+results <- do.call(rbind, lapply(subgroups, function(sg) {
+  data_subset <- cps_mincer %>% filter(subgroup == sg)
+  mincer_est(data_subset, sg)
+}))
+
+results
+```
+
+### Step 3: Visualize the results
+
+Create visualizations to compare the returns to education across subgroups:
+
+```{r q1-visualize}
+# 1. Bar plot of returns to education
+ggplot(results, aes(x = subgroup, y = beta_edu, fill = subgroup)) +
+  geom_col() +
+  labs(
+    title = "Returns to Education by Subgroup",
+    x = "Subgroup",
+    y = "Return to Education (beta_1)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(fill = "none")
+
+# 2. Scatter plot of log wages vs. education
+ggplot(cps_mincer, aes(x = education, y = log_wage, color = subgroup)) +
+  geom_point(alpha = 0.3, size = 0.5) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(
+    title = "Log Wages vs Education by Subgroup",
+    x = "Years of Education",
+    y = "Log Hourly Wage",
+    color = "Subgroup"
+  ) +
+  theme_minimal()
+
+# 3. Experience-wage profiles by subgroup
+exp_seq <- seq(0, 40, by = 1)
+
+pred_profiles <- do.call(rbind, lapply(1:nrow(results), function(i) {
+  row <- results[i, ]
+  data_subset <- cps_mincer %>% filter(subgroup == row$subgroup)
+  median_edu <- median(data_subset$education)
+
+  data.frame(
+    subgroup = row$subgroup,
+    experience = exp_seq,
+    log_wage_pred = row$alpha + row$beta_edu * median_edu +
+                    row$beta_exp * exp_seq + row$beta_exp2 * exp_seq^2
+  )
+}))
+
+ggplot(pred_profiles, aes(x = experience, y = log_wage_pred, color = subgroup)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Experience-Wage Profiles by Subgroup",
+    subtitle = "Based on median education level within each subgroup",
+    x = "Years of Experience",
+    y = "Predicted Log Hourly Wage",
+    color = "Subgroup"
+  ) +
+  theme_minimal()
+```
+
+### Step 4: Interpret the results
+
+The estimates show positive returns to education for all four subgroups. In the supplied course solution, the education coefficient is about 0.078 for men with high school or less, 0.117 for men with college or more, 0.073 for women with high school or less, and 0.116 for women with college or more. Because the dependent variable is log hourly wage, these coefficients imply that an additional year of schooling is associated with a larger percentage increase in hourly wages for the College+ groups than for the High School or Less groups.
+
+The experience coefficient is positive while the squared-experience coefficient is negative in every subgroup. This produces the standard concave Mincer profile: predicted wages rise with experience, but the rate of increase becomes smaller as experience accumulates. The model fits the College+ groups better than the High School or Less groups, with R-squared values around 0.185-0.186 for the College+ samples compared with about 0.092-0.121 for the other two groups.
+
+## 2. Rolling Window Estimation of the AR(1) Model
+
+### The AR(1) Model
+
+The AR(1) model for inflation is:
+$$\text{infl}_t = \alpha + \rho \cdot \text{infl}_{t-1} + \varepsilon_t$$
+
+Where:
+- $\alpha$ is the intercept (constant term)
+- $\rho$ is the persistence parameter (how much current inflation depends on past inflation)
+- $\varepsilon_t$ is the error term
+
+In this exercise, we will implement rolling window estimation to examine how the persistence of inflation changes over time.
+
+### What is Rolling Window Estimation?
+
+**Rolling window estimation** is a technique used in time series analysis to examine how model parameters change over time. Instead of estimating a model once using all available data, we estimate the model repeatedly using only a fixed-size "window" of recent observations.
+
+**Key concepts:**
+
+- **Window size**: The number of observations used in each estimation (we'll use 120 months = 10 years)
+- **Rolling**: The window moves forward one observation at a time
+- **Time-varying parameters**: This allows us to see how relationships change over time
+
+**Example with our data:**
+
+- Start with observations 1-120, estimate AR(1) model
+- Move to observations 2-121, estimate AR(1) model  
+- Move to observations 3-122, estimate AR(1) model
+- Continue until we reach the end of the data
+
+**Visual representation (window size = 120):**
+```
+Time:     1  2  3  4  ........................... 120 121 ... T
+Window 1: [████████████████████████████████████████]
+Window 2:    [████████████████████████████████████████]
+Window 3:       [████████████████████████████████████████]
+...
+```
+
+Each window gives us one estimate of ρ, creating a time series of ρ estimates.
+
+**Why use rolling windows?**
+1. **Structural breaks**: Economic relationships may change over time
+2. **Parameter stability**: Test if model parameters are constant
+3. **Forecasting**: More recent data may be more relevant for predictions
+4. **Policy analysis**: Understand how economic relationships evolve
+
+
+### Step 1: Prepare the inflation data
+
+```{r q2-prepare-data}
+infl_data <- data_wg %>%
+  select(date, infl) %>%
+  filter(!is.na(infl)) %>%
+  mutate(infl_lag = lag(infl, 1)) %>%
+  filter(!is.na(infl_lag))
+
+head(infl_data)
+```
+
+### Step 2: Implement rolling window estimation
+
+```{r q2-rolling-estimation}
+ar1_est <- function(data_window) {
+  model <- lm(infl ~ infl_lag, data = data_window)
+  coefs <- coef(model)
+  se <- summary(model)$coefficients[, "Std. Error"]
+
+  data.frame(
+    alpha = unname(coefs[1]),
+    rho = unname(coefs[2]),
+    se_alpha = unname(se[1]),
+    se_rho = unname(se[2]),
+    r_squared = summary(model)$r.squared
+  )
+}
+
+window_size <- 120
+n_windows <- nrow(infl_data) - window_size + 1
+rolling_results <- vector("list", n_windows)
+
+for (i in seq_len(n_windows)) {
+  window_data <- infl_data[i:(i + window_size - 1), ]
+  est <- ar1_est(window_data)
+
+  rolling_results[[i]] <- cbind(
+    date = infl_data$date[i + window_size - 1],
+    est
+  )
+}
+
+rolling_estimates <- do.call(rbind, rolling_results)
+
+head(rolling_estimates)
+tail(rolling_estimates)
+```
+
+### Step 3: Visualize the results
+
+```{r q2-visualize}
+ggplot(rolling_estimates, aes(x = date, y = rho)) +
+  geom_line(color = "blue", linewidth = 0.8) +
+  geom_ribbon(
+    aes(ymin = rho - 1.96 * se_rho, ymax = rho + 1.96 * se_rho),
+    alpha = 0.2, fill = "blue"
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "darkgreen") +
+  labs(
+    title = "Rolling Window Estimates of AR(1) Persistence Parameter (rho)",
+    subtitle = "Window size: 120 months (10 years), with 95% confidence bands",
+    x = "Date (End of Window)",
+    y = "rho (Persistence Parameter)",
+    caption = "Dashed lines: rho = 0 (no persistence) and rho = 1 (unit root)"
+  ) +
+  theme_minimal() +
+  theme(plot.caption = element_text(hjust = 0))
+```
+
+The rolling estimates show that inflation persistence is time-varying rather than constant. The estimated AR(1) coefficient, rho, changes substantially across 10-year windows. Values closer to one indicate that inflation shocks are more persistent, while values closer to zero indicate that shocks dissipate more quickly. The confidence band also changes through time, so the precision of the persistence estimate is not constant.
+
+The supplied course solution ends with rho around 0.369 in December 2018, after values above 0.5 earlier in 2018. More generally, the plot indicates structural variation in the inflation process over the sample. These changes can be consistent with shifts in monetary-policy regimes, major macroeconomic shocks, and changes in inflation expectations.
+
+
